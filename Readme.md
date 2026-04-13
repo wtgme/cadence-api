@@ -1,6 +1,6 @@
 # cadence-api
 
-FastAPI inference servers for the [Cadence](https://github.com/wtgme/cadence) Android app, running on KCL CREATE HPC (GPU cluster). The app generates personalised instrumental music from biometric data via a two-step AI pipeline.
+FastAPI inference servers for the [Cadence](https://github.com/wtgme/cadence) Android app, running on a GPU HPC cluster. The app generates personalised instrumental music from biometric data via a two-step AI pipeline.
 
 ## Servers
 
@@ -63,7 +63,7 @@ Pillow
 
 ## Infrastructure
 
-- **Cluster:** KCL CREATE HPC — jobs managed via Slurm
+- **Cluster:** HPC cluster — jobs managed via Slurm
 - **GPU:** L40S (48 GB VRAM)
 - **Working dir:** `/users/k1810895/data/musicgen`
 - **Conda env:** `musicgen` (Python 3.10)
