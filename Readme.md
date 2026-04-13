@@ -1,0 +1,6 @@
+- models--suno--bark:  generate an audio version of text prompt, just reading
+- models--facebook--musicgen-melody-large: generate white noise
+- models--stabilityai--stable-audio-open-1.0: nothing came out. 
+- HeartMuLa: needs lyrics. https://arxiv.org/pdf/2601.10547. OOM in L40S
+- lglg666/SongGeneration-v2-large: https://arxiv.org/pdf/2506.07520 
+- gemma: for interpret signals 

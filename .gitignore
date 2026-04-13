@@ -1,0 +1,16 @@
+# Model weights and large data
+songgeneration/
+heartmula/
+
+# Runtime
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.deploy_pids
+
+# Secrets / local config
+*.env
+.env*
+local.properties
