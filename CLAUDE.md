@@ -4,24 +4,37 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## Overview
 
-Two inference servers running on the same GPU machine (erc-hpc-comp204), both using the `musicgen` conda env (Python 3.10):
+Three inference servers, all using the `musicgen` conda env (Python 3.10):
 
-| Server | File | Port | Model | Conda env |
-|---|---|---|---|---|
-| SongGeneration (**default**) | `songgeneration_server.py` | 8000 | `SongGeneration-v2-large` (4B params) | `musicgen` (Python 3.10) |
-| HeartMuLa | `heartmula_server.py` | 8000 | `HeartMuLa-oss-3B-happy-new-year` (3B params) | `musicgen` (Python 3.10) |
+| Server | File | Port | Model | GPUs | Conda env |
+|---|---|---|---|---|---|
+| SongGeneration vLLM (**default**) | `songgeneration_vllm_server.py` | 8000 | `SongGeneration-v2-large` (4B params) | multi-GPU batched | `musicgen` (Python 3.10) |
+| SongGeneration (legacy) | `songgeneration_server.py` | 8000 | `SongGeneration-v2-large` (4B params) | single GPU | `musicgen` (Python 3.10) |
+| HeartMuLa | `heartmula_server.py` | 8000 | `HeartMuLa-oss-3B-happy-new-year` (3B params) | single GPU | `musicgen` (Python 3.10) |
 
-**Both servers expose identical REST APIs on port 8000 — only one runs at a time.** SongGeneration is the default deployment; HeartMuLa is an alternative that can be swapped in by restarting on port 8000. The Android app switches between them by redeploying the server (no client-side URL change needed).
+**All servers expose identical REST APIs on port 8000 — only one runs at a time.** The vLLM server is the default deployment; it spawns one worker per GPU and batches concurrent requests for higher throughput. The Android app does not need changes — same base URL.
 
 ## Starting the servers
 
 ```bash
-# SongGeneration (port 8000) — DEFAULT
+# SongGeneration vLLM (port 8000) — DEFAULT (multi-GPU, batched)
+# Set SONGGEN_GPU_IDS to the GPUs you want to use (default: "0,1")
+nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && SONGGEN_GPU_IDS=0,1 SONGGEN_BATCH_MAX=2 conda run -n musicgen --no-capture-output python -m uvicorn songgeneration_vllm_server:app --host 0.0.0.0 --port 8000" >> logs/vllm_stdout.log 2>&1 &
+
+# SongGeneration legacy single-GPU (port 8000)
 nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && conda run -n musicgen --no-capture-output python -m uvicorn songgeneration_server:app --host 0.0.0.0 --port 8000" >> logs/songgen_stdout.log 2>&1 &
 
-# HeartMuLa (port 8000) — alternative deployment (stop SongGeneration first)
+# HeartMuLa (port 8000) — alternative deployment (stop other servers first)
 nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && conda run -n musicgen --no-capture-output python -m uvicorn heartmula_server:app --host 0.0.0.0 --port 8000" >> logs/heartmula_stdout.log 2>&1 &
 ```
+
+### vLLM server environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `SONGGEN_GPU_IDS` | `0,1` | Comma-separated GPU ids to use |
+| `SONGGEN_BATCH_MAX` | `2` | Max requests per batch per GPU |
+| `SONGGEN_BATCH_WAIT_MS` | `500` | Max ms to wait for batch to fill |
 
 > Do NOT use `python -m uvicorn` from system Python or activate the env first — use `conda run -n musicgen`.
 > The system `uvicorn` binary is broken. Conda must be sourced via full path (see above).
@@ -29,9 +42,11 @@ nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icel
 ## Checking status / logs
 
 ```bash
-curl http://localhost:8000/health   # whichever server is running
+curl http://localhost:8000/health   # whichever server is running (vLLM shows GPU/queue stats)
 
-tail -f logs/songgen_stdout.log
+tail -f logs/vllm_server.log        # vLLM server structured log
+tail -f logs/vllm_stdout.log        # vLLM server stdout
+tail -f logs/songgen_stdout.log     # legacy server stdout
 tail -f logs/heartmula_stdout.log
 
 # Recent API usage

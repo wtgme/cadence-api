@@ -337,7 +337,16 @@ async def generate(req: GenerateRequest, request: Request):
     output_bytes = 0
     loop = asyncio.get_running_loop()
 
+    # Skip GPU work if the client already went away (e.g. user pressed Stop).
+    if await request.is_disconnected():
+        log.info("[%s] /generate -- client disconnected before queueing, skipping", ip)
+        return Response(status_code=499)
+
     async with _gpu_sem:
+        # Client may have disconnected while waiting for a prior generation.
+        if await request.is_disconnected():
+            log.info("[%s] /generate -- client disconnected while waiting for GPU sem, skipping", ip)
+            return Response(status_code=499)
         try:
             result = await asyncio.wait_for(
                 loop.run_in_executor(
@@ -352,6 +361,13 @@ async def generate(req: GenerateRequest, request: Request):
             audio_bytes = result["mixed"]
             output_bytes = len(audio_bytes)
 
+        except asyncio.CancelledError:
+            # Uvicorn detected client disconnect mid-inference. The inference thread
+            # cannot be interrupted (Python limitation) and will complete in the
+            # background, but the semaphore is released so the next request proceeds.
+            status = "cancelled: client disconnected mid-inference"
+            log.info("[%s] /generate cancelled mid-inference (client disconnected)", ip)
+            raise
         except asyncio.TimeoutError:
             status = "error: generation timed out"
             log.error("[%s] /generate timed out after 300s", ip)
