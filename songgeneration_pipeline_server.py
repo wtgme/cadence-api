@@ -322,7 +322,7 @@ def lm_worker_fn(
     out_queue:    mp.Queue,   # results back to main
 ):
     global SHARED_GPU_MODE
-    SHARED_GPU_MODE = True  # streaming disabled unconditionally
+    SHARED_GPU_MODE = bool(set(LM_GPU_IDS) & set(DIFF_GPU_IDS))
 
     log = logging.getLogger(f"lm-worker-{gpu_id}")
     h = logging.StreamHandler()
