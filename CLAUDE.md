@@ -8,33 +8,68 @@ Three inference servers, all using the `musicgen` conda env (Python 3.10):
 
 | Server | File | Port | Model | GPUs | Conda env |
 |---|---|---|---|---|---|
-| SongGeneration vLLM (**default**) | `songgeneration_vllm_server.py` | 8000 | `SongGeneration-v2-large` (4B params) | multi-GPU batched | `musicgen` (Python 3.10) |
-| SongGeneration (legacy) | `songgeneration_server.py` | 8000 | `SongGeneration-v2-large` (4B params) | single GPU | `musicgen` (Python 3.10) |
-| HeartMuLa | `heartmula_server.py` | 8000 | `HeartMuLa-oss-3B-happy-new-year` (3B params) | single GPU | `musicgen` (Python 3.10) |
+| SongGeneration Pipeline (**default**) | `songgeneration_pipeline_server.py` | 8888 | `SongGeneration-v2-large` (4B params) | auto-split LM+Diff, any N≥1 | `musicgen` (Python 3.10) |
+| SongGeneration vLLM (legacy) | `songgeneration_vllm_server.py` | 8888 | `SongGeneration-v2-large` (4B params) | multi-GPU batched | `musicgen` (Python 3.10) |
+| SongGeneration (legacy) | `songgeneration_server.py` | 8888 | `SongGeneration-v2-large` (4B params) | single GPU | `musicgen` (Python 3.10) |
+| HeartMuLa | `heartmula_server.py` | 8888 | `HeartMuLa-oss-3B-happy-new-year` (3B params) | single GPU | `musicgen` (Python 3.10) |
 
-**All servers expose identical REST APIs on port 8000 — only one runs at a time.** The vLLM server is the default deployment; it spawns one worker per GPU and batches concurrent requests for higher throughput. The Android app does not need changes — same base URL.
+**All servers expose identical REST APIs on port 8888 — only one runs at a time.** The Pipeline server is the default deployment; it auto-detects available GPUs, splits them between LM workers (batched autoregressive) and Diffusion workers (parallel decode), and streams MP3 chunks with ~40s TTFB for first audio. The Android app does not need changes — same base URL.
 
 ## Starting the servers
 
 ```bash
-# SongGeneration vLLM (port 8000) — DEFAULT (multi-GPU, batched)
-# Set SONGGEN_GPU_IDS to the GPUs you want to use (default: "0,1")
-nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && SONGGEN_GPU_IDS=0,1 SONGGEN_BATCH_MAX=2 conda run -n musicgen --no-capture-output python -m uvicorn songgeneration_vllm_server:app --host 0.0.0.0 --port 8000" >> logs/vllm_stdout.log 2>&1 &
+# SongGeneration Pipeline (port 8888) — DEFAULT (auto GPU split, streaming, ~40s TTFB)
+# Auto-detects all available GPUs and splits between LM and Diffusion workers.
+nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && conda run -n musicgen --no-capture-output python -m uvicorn songgeneration_pipeline_server:app --host 0.0.0.0 --port 8888" >> logs/pipeline_stdout.log 2>&1 &
 
-# SongGeneration legacy single-GPU (port 8000)
-nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && conda run -n musicgen --no-capture-output python -m uvicorn songgeneration_server:app --host 0.0.0.0 --port 8000" >> logs/songgen_stdout.log 2>&1 &
+# SongGeneration vLLM (port 8888) — batched only, no streaming
+nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && SONGGEN_GPU_IDS=0,1 SONGGEN_BATCH_MAX=2 conda run -n musicgen --no-capture-output python -m uvicorn songgeneration_vllm_server:app --host 0.0.0.0 --port 8888" >> logs/vllm_stdout.log 2>&1 &
 
-# HeartMuLa (port 8000) — alternative deployment (stop other servers first)
-nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && conda run -n musicgen --no-capture-output python -m uvicorn heartmula_server:app --host 0.0.0.0 --port 8000" >> logs/heartmula_stdout.log 2>&1 &
+# SongGeneration legacy single-GPU (port 8888)
+nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && conda run -n musicgen --no-capture-output python -m uvicorn songgeneration_server:app --host 0.0.0.0 --port 8888" >> logs/songgen_stdout.log 2>&1 &
+
+# HeartMuLa (port 8888) — alternative model
+nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && conda run -n musicgen --no-capture-output python -m uvicorn heartmula_server:app --host 0.0.0.0 --port 8888" >> logs/heartmula_stdout.log 2>&1 &
 ```
 
-### vLLM server environment variables
+### Pipeline server environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `SONGGEN_GPU_IDS` | `0,1` | Comma-separated GPU ids to use |
-| `SONGGEN_BATCH_MAX` | `2` | Max requests per batch per GPU |
+| `SONGGEN_LM_GPU_IDS` | auto | Comma-separated GPU ids for LM workers (leave unset for auto) |
+| `SONGGEN_DIFF_GPU_IDS` | auto | Comma-separated GPU ids for Diff workers (leave unset for auto) |
+| `SONGGEN_BATCH_MAX` | `2` | Max requests per LM batch |
 | `SONGGEN_BATCH_WAIT_MS` | `500` | Max ms to wait for batch to fill |
+| `SONGGEN_COMPILE` | `0` | Set to `1` to enable `torch.compile(reduce-overhead)` on the LM — ~20–35% faster per-token after warm-up; first request takes several extra minutes to compile |
+| `SONGGEN_TP_SIZE` | `1` | GPUs per LM worker for tensor parallelism. Set to `2` to split each LM worker across 2 GPUs via DTensor (ColwiseParallel + RowwiseParallel on all attention/FFN layers). ~1.7× faster per-song; fewer concurrent workers. Flash Attention 2 is automatically disabled for TP. |
+| `SONGGEN_TP_BASE_PORT` | `29500` | Base TCP port for NCCL rendezvous between TP rank pairs. Each TP worker pair uses `base_port + worker_id * 10`. |
+
+Auto-split: both vars must be set together or both left unset.
+
+**TP_SIZE=1 (default):** `diff = max(1, N//6)`, `lm = N - diff`
+
+| N GPUs | LM workers | Diff workers |
+|---|---|---|
+| 1 | 1 (shared) | 1 (shared) |
+| 2 | 1 | 1 |
+| 4 | 3 | 1 |
+| 8 | 7 | 1 |
+
+**TP_SIZE=2:** `n_lm_workers = (N-1)//2`, `diff = N - n_lm_workers*2`
+
+| N GPUs | LM workers (×2 GPU each) | Diff workers |
+|---|---|---|
+| 4 | 1 | 2 |
+| 6 | 2 | 2 |
+| 8 | 3 | 2 |
+
+**Trade-off:** TP=2 reduces per-song latency ~1.7× but halves the number of concurrent songs. Best for low-concurrency use cases (e.g. Android app with one user at a time). GPU interconnect is PCIe NODE (no NVLink); all-reduce overhead is ~6 s per song (~3%) — acceptable.
+
+**Why 1 diff worker is enough (TP=1):** diff decodes 1 chunk in ~1.8 s; in the ~3 min an LM takes it processes ~100 chunks — capacity for ~16 concurrent LM workers.
+
+**Memory during startup:** each worker loads `model.pt` (13 GB, mmap) + `model_septoken` (4.5 GB) — peak ~16 GB CPU RAM per worker. Workers load **sequentially** (each waits for "ready" before the next starts), so total peak ≈ 16 GB + N × 0.5 GB ≈ 20 GB for 8 GPUs. An **80 GB job is sufficient**. Loading simultaneously would require N × 16 GB and OOM at 80 GB with ≥6 GPUs.
+
+**Performance optimisations already active:** Flash Attention 2, cuDNN auto-tune (benchmark=True), TF32 matmul (allow_tf32=True), float16 weights, CUDA cache cleared after every decode.
 
 > Do NOT use `python -m uvicorn` from system Python or activate the env first — use `conda run -n musicgen`.
 > The system `uvicorn` binary is broken. Conda must be sourced via full path (see above).
@@ -42,7 +77,7 @@ nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icel
 ## Checking status / logs
 
 ```bash
-curl http://localhost:8000/health   # whichever server is running (vLLM shows GPU/queue stats)
+curl http://localhost:8888/health   # whichever server is running (vLLM shows GPU/queue stats)
 
 tail -f logs/vllm_server.log        # vLLM server structured log
 tail -f logs/vllm_stdout.log        # vLLM server stdout
@@ -50,10 +85,10 @@ tail -f logs/songgen_stdout.log     # legacy server stdout
 tail -f logs/heartmula_stdout.log
 
 # Recent API usage
-curl http://localhost:8000/usage
+curl http://localhost:8888/usage
 ```
 
-## SongGeneration API (`songgeneration_server.py`, port 8000)
+## SongGeneration API (`songgeneration_server.py`, port 8888)
 
 `POST /generate` — JSON body → MP3 audio bytes
 
@@ -77,7 +112,7 @@ curl http://localhost:8000/usage
 `GET /health` — liveness + model loaded status  
 `GET /usage?n=50` — tail recent API usage log
 
-## HeartMuLa API (`heartmula_server.py`, port 8000)
+## HeartMuLa API (`heartmula_server.py`, port 8888)
 
 Same REST interface as SongGeneration — Android app can switch servers without changing the base URL.
 

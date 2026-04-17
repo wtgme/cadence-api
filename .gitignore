@@ -13,4 +13,10 @@ __pycache__/
 # Secrets / local config
 *.env
 .env*
+!.env.example
 local.properties
+
+# Local tooling / runtime state
+.claude/
+.active_model
+*.bak
