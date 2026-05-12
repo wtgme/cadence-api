@@ -622,8 +622,14 @@ def diff_worker_fn(
 
         except Exception as exc:
             log.exception("Diffusion failed for req=%s chunk=%d", job.request_id, job.chunk_index)
+            is_cuda_fatal = isinstance(exc, RuntimeError) and (
+                "CUDA error" in str(exc) or "device-side assert" in str(exc)
+            )
             gc.collect()
-            torch.cuda.empty_cache()
+            if not is_cuda_fatal:
+                # Only call empty_cache on a healthy CUDA context — calling it on a
+                # poisoned context raises another RuntimeError and masks the real error.
+                torch.cuda.empty_cache()
             out_queue.put(ChunkResult(
                 request_id=job.request_id,
                 chunk_index=job.chunk_index,
@@ -631,6 +637,13 @@ def diff_worker_fn(
                 is_final=job.is_final,
                 error=str(exc),
             ))
+            if is_cuda_fatal:
+                # CUDA device-side assert poisons the entire GPU context for this process.
+                # No further tensor operations will succeed. Exit so the scheduler's
+                # watchdog can restart this worker with a fresh CUDA context.
+                log.error("CUDA context poisoned on gpu%d — exiting diff worker for restart",
+                          gpu_id)
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +659,11 @@ class PendingRequest:
     client_ip:   str
     total_chunks_expected: int = -1   # set when lm_batch_done received
     chunks_received:       int = 0
+    # Reorder buffer: diff workers pull from a shared queue and can finish
+    # out of chunk_index order. Hold chunks until the contiguous prefix from
+    # next_chunk_to_emit is ready, then flush to the client queue in order.
+    next_chunk_to_emit:    int = 0
+    reorder_buffer:        dict = field(default_factory=dict)
 
 
 class PipelineScheduler:
@@ -745,12 +763,13 @@ class PipelineScheduler:
         log.info("All workers ready (lm_workers=%d, diff_workers=%d)",
                  len(self.lm_input_queues), len(self.diff_processes))
 
-    async def submit(self, params: dict, client_ip: str) -> asyncio.Queue:
-        """Submit a streaming request. Returns a per-request asyncio.Queue of MP3 chunks.
-        Sentinel: None → stream finished. Exception object → error."""
+    async def submit(self, params: dict, client_ip: str) -> tuple[str, asyncio.Queue]:
+        """Submit a streaming request. Returns (request_id, chunk_queue).
+        Caller must pop scheduler.pending[request_id] when done (or on
+        client disconnect) to free the reorder buffer.
+        Sentinel on chunk_queue: None → stream finished. Exception → error."""
         rid = uuid.uuid4().hex[:12]
         params["request_id"] = rid
-        loop = asyncio.get_running_loop()
         cq: asyncio.Queue = asyncio.Queue()
         pr = PendingRequest(
             request_id=rid, params=params, chunk_queue=cq,
@@ -758,7 +777,7 @@ class PipelineScheduler:
         )
         self.pending[rid] = pr
         await self.request_queue.put(pr)
-        return cq
+        return rid, cq
 
     async def scheduler_loop(self):
         log.info("Scheduler loop started (lm_gpus=%s, diff_gpus=%s, batch_max=%d)",
@@ -809,20 +828,36 @@ class PipelineScheduler:
             if isinstance(msg, ChunkResult):
                 pr = self.pending.get(msg.request_id)
                 if pr is None:
+                    # Client disconnected or request already closed. Drop the chunk.
                     continue
                 if msg.error:
+                    # Errors force immediate close; buffered chunks are discarded.
                     await pr.chunk_queue.put(RuntimeError(msg.error))
-                elif msg.mp3_bytes:
-                    await pr.chunk_queue.put(msg.mp3_bytes)
-                pr.chunks_received += 1
-
-                # Check if stream is complete
-                if msg.is_final or (
-                    pr.total_chunks_expected >= 0
-                    and pr.chunks_received >= pr.total_chunks_expected
-                ):
-                    await pr.chunk_queue.put(None)   # sentinel: stream done
+                    await pr.chunk_queue.put(None)
                     self.pending.pop(msg.request_id, None)
+                    continue
+
+                # Buffer by chunk_index. Diff workers pull from a shared queue
+                # so chunk N+1 can finish before chunk N — flush only the
+                # contiguous prefix starting at next_chunk_to_emit.
+                pr.reorder_buffer[msg.chunk_index] = msg
+                closed = False
+                while pr.next_chunk_to_emit in pr.reorder_buffer:
+                    emit = pr.reorder_buffer.pop(pr.next_chunk_to_emit)
+                    if emit.mp3_bytes:
+                        await pr.chunk_queue.put(emit.mp3_bytes)
+                    pr.chunks_received     += 1
+                    pr.next_chunk_to_emit  += 1
+                    if emit.is_final or (
+                        pr.total_chunks_expected >= 0
+                        and pr.chunks_received >= pr.total_chunks_expected
+                    ):
+                        await pr.chunk_queue.put(None)
+                        self.pending.pop(msg.request_id, None)
+                        closed = True
+                        break
+                if closed:
+                    continue
 
             elif isinstance(msg, dict):
                 if msg["type"] == "lm_batch_done":
@@ -847,6 +882,37 @@ class PipelineScheduler:
                         await pr.chunk_queue.put(RuntimeError(msg["error"]))
                         await pr.chunk_queue.put(None)
                         self.pending.pop(rid, None)
+
+    async def watchdog_loop(self):
+        """Restart diff workers that exited due to CUDA errors.
+
+        A device-side assert poisons the GPU context for the whole process; the
+        worker exits cleanly so this watchdog can spawn a fresh replacement.
+        LM workers are not restarted automatically — an LM crash usually means
+        the model weights need reloading (expensive); alert via logs instead.
+        """
+        while True:
+            await asyncio.sleep(20)
+            for idx, p in enumerate(self.diff_processes):
+                if not p.is_alive():
+                    gpu_id    = DIFF_GPU_IDS[idx]
+                    worker_id = len(LM_GPU_IDS) + idx
+                    log.warning(
+                        "Diff worker %d (gpu%d, pid=%d, exit=%s) died — restarting",
+                        idx, gpu_id, p.pid, p.exitcode,
+                    )
+                    new_p = mp.Process(
+                        target=diff_worker_fn,
+                        args=(worker_id, gpu_id, self.diff_queue, self.output_queue),
+                        daemon=True, name=f"diff-gpu{gpu_id}",
+                    )
+                    new_p.start()
+                    self.diff_processes[idx] = new_p
+                    log.info("Restarted diff worker gpu%d (pid=%d) — loading model (~2 min)",
+                             gpu_id, new_p.pid)
+            lm_alive = sum(1 for p in self.lm_processes if p.is_alive())
+            if lm_alive == 0:
+                log.critical("ALL LM workers dead — server is stalled. Restart the service.")
 
     def shutdown(self):
         for q in self.lm_input_queues:
@@ -875,6 +941,38 @@ def _check_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(_b
         raise HTTPException(401, "Invalid or missing Bearer token")
 
 
+async def _warmup():
+    """Submit one dummy BGM generation after workers come up so the first
+    real request doesn't pay the JIT cost (flash-attn kernels, cuDNN
+    autotune, diffusion warmup) on top of the ~250 s cold start.
+
+    Set SONGGEN_SKIP_WARMUP=1 to disable (e.g. during dev restarts).
+    """
+    try:
+        params = {
+            "lyric":                  ".",
+            "descriptions":           "electronic, calm, ambient",
+            "auto_prompt_audio_type": "Electronic",
+            "generate_type":          "bgm",
+        }
+        log.info("Warmup: submitting dummy BGM request")
+        rid, cq = await scheduler.submit(params, "warmup")
+        t0 = time.time()
+        try:
+            while True:
+                item = await asyncio.wait_for(cq.get(), timeout=900)
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    log.warning("Warmup error: %s", item)
+                    break
+        finally:
+            scheduler.pending.pop(rid, None)
+        log.info("Warmup complete in %.1fs", time.time() - t0)
+    except Exception:
+        log.exception("Warmup failed (non-fatal)")
+
+
 @app.on_event("startup")
 async def startup():
     scheduler.available_lm   = asyncio.Queue()
@@ -883,6 +981,9 @@ async def startup():
     await scheduler.start_workers_parallel()
     asyncio.create_task(scheduler.scheduler_loop())
     asyncio.create_task(scheduler.result_listener())
+    asyncio.create_task(scheduler.watchdog_loop())
+    if os.environ.get("SONGGEN_SKIP_WARMUP", "").strip() != "1":
+        asyncio.create_task(_warmup())
     log.info("Server ready")
 
 
@@ -1045,35 +1146,73 @@ def _strip_xing_frame(mp3: bytes) -> bytes:
     return mp3
 
 
+# Single-byte null heartbeat. MP3 decoders (ExoPlayer, ffmpeg, etc.) scan
+# forward for the MPEG sync word (0xFF Ex/Fx) and tolerate stray null bytes
+# between frames, so these bytes are safe to inject into the stream. Their
+# purpose is to get response headers + an initial HTTP chunk on the wire so
+# Cloudflare (and other proxies) stop counting toward the 524 "origin
+# timeout" limit while the LM pipeline is still producing chunk 0.
+HEARTBEAT_BYTE     = b"\x00"
+HEARTBEAT_INTERVAL = 25.0   # seconds between heartbeats while waiting for chunk 0
+STREAM_TIMEOUT     = 600.0  # total per-request deadline
+
+
 async def _stream_request(req: GenerateRequest, ip: str):
-    """Core async generator shared by /generate and /generate_stream."""
+    """Core async generator shared by /generate and /generate_stream.
+
+    Heartbeat: yields HEARTBEAT_BYTE every HEARTBEAT_INTERVAL seconds until
+    the first real MP3 chunk arrives. Buffered consumers (/generate and
+    /v1/music_generation) filter these out by checking `chunk == HEARTBEAT_BYTE`
+    before writing to their accumulation buffer.
+    """
     params = {
         "lyric":                  req.lyric,
         "descriptions":           req.descriptions,
         "auto_prompt_audio_type": req.auto_prompt_audio_type,
         "generate_type":          req.generate_type,
     }
-    cq = await scheduler.submit(params, ip)
+    rid, cq = await scheduler.submit(params, ip)
     t0 = time.time()
     chunks_out = 0
     bytes_out  = 0
     status     = "ok"
+    first_real_received = False
     try:
         while True:
-            item = await asyncio.wait_for(cq.get(), timeout=600)
+            elapsed = time.time() - t0
+            if elapsed >= STREAM_TIMEOUT:
+                status = "error: timeout"
+                raise HTTPException(504, f"Streaming timed out after {STREAM_TIMEOUT:.0f}s")
+            # Short wait before chunk 0 so we can emit heartbeats; longer wait
+            # afterwards (diff chunks arrive every ~2s once decoding starts).
+            if not first_real_received:
+                wait = min(HEARTBEAT_INTERVAL, STREAM_TIMEOUT - elapsed)
+            else:
+                wait = min(60.0, STREAM_TIMEOUT - elapsed)
+            try:
+                item = await asyncio.wait_for(cq.get(), timeout=wait)
+            except asyncio.TimeoutError:
+                if not first_real_received:
+                    yield HEARTBEAT_BYTE
+                # Either way, loop and re-check deadline.
+                continue
             if item is None:
                 break
             if isinstance(item, Exception):
                 status = f"error: {item}"
                 raise item
+            first_real_received = True
             item = _strip_xing_frame(item)
             chunks_out += 1
             bytes_out  += len(item)
             yield item
-    except asyncio.TimeoutError:
-        status = "error: timeout"
-        raise HTTPException(504, "Streaming timed out after 600s")
     finally:
+        # Drop the pending entry so late-arriving diff results (e.g. after a
+        # client disconnect) are discarded by result_listener instead of
+        # queueing forever against an abandoned asyncio.Queue.
+        pr = scheduler.pending.pop(rid, None)
+        if pr is not None:
+            pr.reorder_buffer.clear()
         log_usage({
             "endpoint":               "/generate_stream",
             "client_ip":              ip,
@@ -1125,6 +1264,8 @@ async def music_generation(req: MiniMaxRequest, request: Request):
     chunks_out = 0
     try:
         async for chunk in _stream_request(gen_req, ip):
+            if chunk == HEARTBEAT_BYTE:
+                continue
             buf.write(chunk)
             chunks_out += 1
     except Exception as exc:
@@ -1215,6 +1356,8 @@ async def generate(req: GenerateRequest, request: Request):
     t0 = time.time()
     buf = io.BytesIO()
     async for chunk in _stream_request(req, ip):
+        if chunk == HEARTBEAT_BYTE:
+            continue
         buf.write(chunk)
     audio = buf.getvalue()
     elapsed = time.time() - t0
