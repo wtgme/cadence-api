@@ -48,28 +48,42 @@ def _run_growing_cache(attn, hidden_states_list, device):
 
 
 def _run_static_cache(attn, hidden_states_list, device, max_seq=64):
-    """Run N decode steps using pre-allocated static buffer + cache_position."""
+    """Run N decode steps using static buffer for S=1 steps, growing cache for S>1 prefill."""
     cfg = attn.config
-    n_heads = cfg.num_attention_heads
-    head_dim = cfg.hidden_size // n_heads
+    n_heads = cfg.num_key_value_heads   # fix: use kv heads, not attention heads
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
     B = hidden_states_list[0].shape[0]
     dtype = hidden_states_list[0].dtype
 
     k_buf = torch.zeros(B, n_heads, max_seq, head_dim, device=device, dtype=dtype)
     v_buf = torch.zeros(B, n_heads, max_seq, head_dim, device=device, dtype=dtype)
-    static_kv = (k_buf, v_buf)
 
     outputs = []
     cache_pos = 0
+    past_kv = None  # used only during prefill (S>1)
+
     for hs in hidden_states_list:
-        B, S, D = hs.shape
+        B_step, S, D = hs.shape
         pos = torch.arange(cache_pos, cache_pos + S, device=device).unsqueeze(0)
-        out, _, _ = attn(
-            hs, position_ids=pos,
-            past_key_value=static_kv,
-            use_cache=True,
-            cache_position=cache_pos,
-        )
+
+        if S > 1:
+            # Prefill: use growing cache, then seed the static buffer
+            out, _, past_kv = attn(
+                hs, position_ids=pos, past_key_value=past_kv, use_cache=True
+            )
+            # Seed static buffer from prefill result
+            for layer_idx, (k_p, v_p) in enumerate([(past_kv[0], past_kv[1])]):
+                T = k_p.shape[2]
+                k_buf[:, :, :T, :] = k_p
+                v_buf[:, :, :T, :] = v_p
+        else:
+            # Decode: use static buffer with cache_position
+            out, _, _ = attn(
+                hs, position_ids=pos,
+                past_key_value=(k_buf, v_buf),
+                use_cache=True,
+                cache_position=cache_pos,
+            )
         outputs.append(out)
         cache_pos += S
     return outputs
@@ -84,7 +98,7 @@ def test_static_cache_matches_growing_cache(flash):
     attn_cls = LlamaFlashAttention2 if flash else LlamaAttention
     attn = attn_cls(cfg).to(device).eval()
 
-    # 3 decode steps: 1 token each
+    # 5 decode steps: 1 token each
     hidden_list = [
         torch.randn(1, 1, cfg.hidden_size, device=device)
         for _ in range(5)
