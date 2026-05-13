@@ -89,18 +89,19 @@ def _run_static_cache(attn, hidden_states_list, device, max_seq=64):
     return outputs
 
 
-@pytest.mark.parametrize("flash", [False])
+@pytest.mark.parametrize("flash", [False, True])
 def test_static_cache_matches_growing_cache(flash):
     """Static cache must produce bit-identical outputs to growing cache."""
     torch.manual_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = _make_config(flash=flash)
     attn_cls = LlamaFlashAttention2 if flash else LlamaAttention
-    attn = attn_cls(cfg).to(device).eval()
+    dtype = torch.float16 if flash else torch.float32
+    attn = attn_cls(cfg).to(device=device, dtype=dtype).eval()
 
     # 5 decode steps: 1 token each
     hidden_list = [
-        torch.randn(1, 1, cfg.hidden_size, device=device)
+        torch.randn(1, 1, cfg.hidden_size, device=device, dtype=dtype)
         for _ in range(5)
     ]
 
