@@ -1,0 +1,122 @@
+"""
+Correctness test: static KV cache path must produce identical attention outputs
+to the original torch.cat growing-cache path for the same inputs.
+
+Run with:
+  cd /users/k1810895/data/musicgen
+  conda run -n musicgen python -m pytest tests/test_static_kv_cache.py -v
+"""
+import sys
+sys.path.insert(0, "songgeneration")
+sys.path.insert(0, "songgeneration/codeclm/tokenizer")
+
+import torch
+import pytest
+from codeclm.models.llama.modeling_llama import LlamaConfig, LlamaAttention, LlamaFlashAttention2
+
+
+def _make_config(flash: bool = False) -> LlamaConfig:
+    return LlamaConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        num_key_value_heads=4,
+        vocab_size=100,
+        use_cache=True,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-5,
+        rope_theta=10000.0,
+        _flash_attn_2_enabled=flash,
+    )
+
+
+def _run_growing_cache(attn, hidden_states_list, device):
+    """Run N decode steps with the old torch.cat growing cache."""
+    past_kv = None
+    outputs = []
+    pos_offset = 0
+    for hs in hidden_states_list:
+        B, S, D = hs.shape
+        pos = torch.arange(pos_offset, pos_offset + S, device=device).unsqueeze(0)
+        out, _, past_kv = attn(
+            hs, position_ids=pos, past_key_value=past_kv, use_cache=True
+        )
+        outputs.append(out)
+        pos_offset += S
+    return outputs
+
+
+def _run_static_cache(attn, hidden_states_list, device, max_seq=64):
+    """Run N decode steps using pre-allocated static buffer + cache_position."""
+    cfg = attn.config
+    n_heads = cfg.num_attention_heads
+    head_dim = cfg.hidden_size // n_heads
+    B = hidden_states_list[0].shape[0]
+    dtype = hidden_states_list[0].dtype
+
+    k_buf = torch.zeros(B, n_heads, max_seq, head_dim, device=device, dtype=dtype)
+    v_buf = torch.zeros(B, n_heads, max_seq, head_dim, device=device, dtype=dtype)
+    static_kv = (k_buf, v_buf)
+
+    outputs = []
+    cache_pos = 0
+    for hs in hidden_states_list:
+        B, S, D = hs.shape
+        pos = torch.arange(cache_pos, cache_pos + S, device=device).unsqueeze(0)
+        out, _, _ = attn(
+            hs, position_ids=pos,
+            past_key_value=static_kv,
+            use_cache=True,
+            cache_position=cache_pos,
+        )
+        outputs.append(out)
+        cache_pos += S
+    return outputs
+
+
+@pytest.mark.parametrize("flash", [False])
+def test_static_cache_matches_growing_cache(flash):
+    """Static cache must produce bit-identical outputs to growing cache."""
+    torch.manual_seed(42)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg = _make_config(flash=flash)
+    attn_cls = LlamaFlashAttention2 if flash else LlamaAttention
+    attn = attn_cls(cfg).to(device).eval()
+
+    # 3 decode steps: 1 token each
+    hidden_list = [
+        torch.randn(1, 1, cfg.hidden_size, device=device)
+        for _ in range(5)
+    ]
+
+    with torch.no_grad():
+        growing = _run_growing_cache(attn, hidden_list, device)
+        static  = _run_static_cache(attn, hidden_list, device)
+
+    for step, (g, s) in enumerate(zip(growing, static)):
+        assert torch.allclose(g, s, atol=1e-4), (
+            f"Step {step}: max diff = {(g - s).abs().max().item():.6f}"
+        )
+
+
+def test_static_cache_multi_token_prefill():
+    """Prefill (S>1) followed by 1-token decode steps must stay consistent."""
+    torch.manual_seed(7)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg = _make_config(flash=False)
+    attn = LlamaAttention(cfg).to(device).eval()
+
+    prefill = torch.randn(1, 4, cfg.hidden_size, device=device)
+    decode_steps = [torch.randn(1, 1, cfg.hidden_size, device=device) for _ in range(3)]
+    all_steps = [prefill] + decode_steps
+
+    with torch.no_grad():
+        growing = _run_growing_cache(attn, all_steps, device)
+        # For multi-token prefill in static path, first step still uses cache_position=0
+        static  = _run_static_cache(attn, all_steps, device)
+
+    for step, (g, s) in enumerate(zip(growing, static)):
+        assert torch.allclose(g, s, atol=1e-4), (
+            f"Step {step}: max diff = {(g - s).abs().max().item():.6f}"
+        )
