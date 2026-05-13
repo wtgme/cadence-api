@@ -300,7 +300,7 @@ def _load_full_model(gpu_id: int, logger, role: str = "both"):
     if role == "lm" and os.environ.get("SONGGEN_COMPILE", "").strip() == "1":
         import torch._dynamo as _dynamo
         _dynamo.config.suppress_errors = True  # fall back to eager on unsupported ops
-        model.lm = torch.compile(model.lm, mode="reduce-overhead", dynamic=True)
+        model.lm = torch.compile(model.lm, mode="reduce-overhead", dynamic=False)
         logger.info("LM compiled with torch.compile (reduce-overhead, dynamic) on GPU %d", gpu_id)
 
     gc.collect()
