@@ -135,3 +135,70 @@ def test_static_cache_multi_token_prefill():
         assert torch.allclose(g, s, atol=1e-4), (
             f"Step {step}: max diff = {(g - s).abs().max().item():.6f}"
         )
+
+
+def test_end_to_end_generation_completes():
+    """Full LmModel.generate() must complete without error using static cache."""
+    import os
+    sys.path.insert(0, "songgeneration")
+    sys.path.insert(0, "songgeneration/codeclm/tokenizer")
+    sys.path.insert(0, "songgeneration/codeclm/tokenizer/Flow1dVAE")
+    os.chdir("songgeneration")
+    # Re-insert Flow1dVAE path relative to new cwd so model_septoken is importable
+    flow_path = "codeclm/tokenizer/Flow1dVAE"
+    if flow_path not in sys.path:
+        sys.path.insert(0, flow_path)
+
+    from omegaconf import OmegaConf
+    OmegaConf.register_new_resolver("eval",      lambda x: eval(x),                       replace=True)
+    OmegaConf.register_new_resolver("concat",    lambda *x: [i for s in x for i in s],   replace=True)
+    OmegaConf.register_new_resolver("get_fname", lambda: "server",                        replace=True)
+    OmegaConf.register_new_resolver("load_yaml", lambda x: list(OmegaConf.load(x)),      replace=True)
+
+    from codeclm.models import builders, CodecLM
+
+    cfg = OmegaConf.load("ckpt/songgeneration_v2_large/config.yaml")
+    cfg.lm.use_flash_attn_2 = True
+    cfg.mode = "inference"
+    cfg.max_dur = 30   # short clip for speed
+
+    audiolm = builders.get_lm_model(cfg, version="v2")
+    ckpt = torch.load("ckpt/songgeneration_v2_large/model.pt", map_location="cpu", mmap=True)
+    sd = {k.replace("audiolm.", ""): v for k, v in ckpt.items() if k.startswith("audiolm")}
+    audiolm.load_state_dict(sd, strict=False)
+    audiolm = audiolm.eval().cuda().to(torch.float16)
+
+    sep_tok = builders.get_audio_tokenizer_model_cpu(cfg.audio_tokenizer_checkpoint_sep, cfg)
+    sep_tok.model.vae   = sep_tok.model.vae.to("cuda")
+    sep_tok.model.model = sep_tok.model.model.to("cuda")
+    sep_tok = sep_tok.eval()
+
+    model = CodecLM(
+        name="test",
+        lm=audiolm,
+        audiotokenizer=None,
+        max_duration=cfg.max_dur,
+        seperate_tokenizer=sep_tok,
+    )
+    model.set_generation_params(
+        duration=cfg.max_dur, extend_stride=5, temperature=0.8,
+        cfg_coef=1.5, top_k=5000, top_p=0.0,
+        record_tokens=True, record_window=50,
+    )
+
+    import time
+    t0 = time.time()
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        with torch.no_grad():
+            tokens = model.generate(
+                lyrics=["."],
+                descriptions=["[Musicality-very-high], [Pure-Music], ambient,calm"],
+                melody_wavs=None, vocal_wavs=None, bgm_wavs=None,
+                melody_is_wav=True, return_tokens=True,
+            )
+    elapsed = time.time() - t0
+
+    assert tokens is not None
+    assert tokens.shape[-1] > 0, "No tokens generated"
+    print(f"\nGeneration time for 30s clip: {elapsed:.1f}s  (tokens shape: {tokens.shape})")
+    os.chdir("..")
