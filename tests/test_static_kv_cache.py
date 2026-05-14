@@ -55,8 +55,8 @@ def _run_static_cache(attn, hidden_states_list, device, max_seq=64):
     B = hidden_states_list[0].shape[0]
     dtype = hidden_states_list[0].dtype
 
-    k_buf = torch.zeros(B, n_heads, max_seq, head_dim, device=device, dtype=dtype)
-    v_buf = torch.zeros(B, n_heads, max_seq, head_dim, device=device, dtype=dtype)
+    k_buf = torch.zeros(B, max_seq, n_heads, head_dim, device=device, dtype=dtype)
+    v_buf = torch.zeros(B, max_seq, n_heads, head_dim, device=device, dtype=dtype)
 
     outputs = []
     cache_pos = 0
@@ -71,11 +71,11 @@ def _run_static_cache(attn, hidden_states_list, device, max_seq=64):
             out, _, past_kv = attn(
                 hs, position_ids=pos, past_key_value=past_kv, use_cache=True
             )
-            # Seed static buffer from prefill result
+            # Seed static buffer from prefill result — convert [B, H, T, D] -> [B, T, H, D]
             for layer_idx, (k_p, v_p) in enumerate([(past_kv[0], past_kv[1])]):
                 T = k_p.shape[2]
-                k_buf[:, :, :T, :] = k_p
-                v_buf[:, :, :T, :] = v_p
+                k_buf[:, :T, :, :] = k_p.permute(0, 2, 1, 3)
+                v_buf[:, :T, :, :] = v_p.permute(0, 2, 1, 3)
         else:
             # Decode: use static buffer with cache_position
             out, _, _ = attn(
