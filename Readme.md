@@ -84,12 +84,48 @@ See `scripts/hpc-tunnel.sh` in the [cadence](https://github.com/wtgme/cadence) r
 - SongGeneration v2-large: https://arxiv.org/pdf/2506.07520
 - HeartMuLa: https://arxiv.org/pdf/2601.10547
 
+## SongGeneration inference optimizations
+
+The upstream LM decode loop in `songgeneration/codeclm/models/llama/modeling_llama.py`
+ran `torch.cat` on the KV cache at every step — O(N²) total memory bandwidth
+over ~6,750 decode steps × 36 layers × CFG batch. This made a 270 s song take
+~6 min 11 s. Three changes in this fork bring it to ~1.6× faster:
+
+1. **Static KV cache.** `LlamaAttention` and `LlamaFlashAttention2` now accept
+   a `cache_position: int`. When set, K/V are written **in place** into a
+   pre-allocated `[B, max_seq, H, D]` buffer instead of growing via `torch.cat`.
+   Buffers are allocated lazily after prefill in `LmModel._init_static_cache`
+   (`songgeneration/codeclm/models/lm_levo.py`) and live in `_streaming_state`
+   across decode calls.
+
+2. **Flash-Decoding.** The decode path in `LlamaFlashAttention2` replaces the
+   write → slice → transpose → `flash_attn_func` sequence with a single fused
+   `flash_attn_with_kvcache` call. This uses the Flash-Decoding kernel
+   (parallelises the KV read across SMs) and writes the new K/V into the cache
+   in-place inside the kernel — eliminating the host-side slice and transpose.
+
+3. **`torch.compile(dynamic=False)`** in `songgeneration_pipeline_server.py`.
+   With fixed-shape decode steps, the compiler can capture and replay a CUDA
+   graph, eliminating Python dispatch overhead. Enable with `SONGGEN_COMPILE=1`
+   (first request pays a ~3–10 min warmup; subsequent requests are fast).
+
+Measured on L40S PCIe (LM on GPUs 1,2; diff on GPU 3):
+
+| Config                                | Wall-s / audio-s | Speedup vs upstream |
+|---------------------------------------|------------------|---------------------|
+| Upstream (growing KV cache)           | 1.37             | 1.00×               |
+| + static KV cache only                | 1.37             | 1.00×               |
+| + static KV cache + `torch.compile`   | 1.24             | 1.10×               |
+| + Flash-Decoding                      | 0.94             | 1.46×               |
+| **+ Flash-Decoding + `torch.compile`**| **0.84**         | **1.63×**           |
+
+Full design notes and benchmark methodology are in
+`docs/superpowers/specs/2026-05-13-static-kv-cache-design.md`,
+`docs/superpowers/plans/2026-05-13-static-kv-cache.md`, and
+`docs/benchmark-results-2026-05-14.md`.
+
 ## Acknowledgments
 
 The `songgeneration/` directory contains source code derived from
 [tencent-ailab/songgeneration](https://github.com/tencent-ailab/songgeneration)
-(Apache 2.0). Local modifications include the static KV cache,
-Flash-Decoding via `flash_attn_with_kvcache`, `torch.compile` integration,
-and batch + token-callback support for the streaming pipeline server.
-See `songgeneration/LICENSE` for the original license and
-`docs/superpowers/` for design notes on the changes.
+(Apache 2.0). See `songgeneration/LICENSE` for the original license.
