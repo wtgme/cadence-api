@@ -36,6 +36,16 @@ fi
 
 echo "GPUs: $N_GPUS total | pipeline GPUs $FIRST_GPU–$(( N_GPUS - 1 )) | LM: $N_LM (GPUs $LM_IDS) | Diff: $N_DIFF (GPU $DIFF_IDS)"
 
-nohup bash -c "source $CONDA_SH && cd $WORKDIR && CUDA_LAUNCH_BLOCKING=1 SONGGEN_SKIP_WARMUP=1 SONGGEN_LM_GPU_IDS=$LM_IDS SONGGEN_DIFF_GPU_IDS=$DIFF_IDS conda run -n musicgen --no-capture-output python -m uvicorn songgeneration_pipeline_server:app --host 0.0.0.0 --port 8888" >> "$WORKDIR/logs/pipeline_stdout.log" 2>&1 &
+nohup bash -c "
+source $CONDA_SH
+cd $WORKDIR
+while true; do
+    echo \"[\$(date)] Starting pipeline server (LM=$LM_IDS Diff=$DIFF_IDS)...\"
+    SONGGEN_COMPILE=1 SONGGEN_LM_GPU_IDS=$LM_IDS SONGGEN_DIFF_GPU_IDS=$DIFF_IDS \
+        conda run -n musicgen --no-capture-output python -m uvicorn songgeneration_pipeline_server:app --host 0.0.0.0 --port 8888
+    echo \"[\$(date)] Server exited (code \$?) — restarting in 15s...\"
+    sleep 15
+done
+" >> "$WORKDIR/logs/pipeline_stdout.log" 2>&1 &
 
 echo "Started SongGen pipeline server (PID $!). Logs: logs/pipeline_stdout.log"

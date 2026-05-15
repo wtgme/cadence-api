@@ -599,6 +599,8 @@ class PromptCondAudioDiffusion(nn.Module):
         batch_size = codes_bestrq_emb.shape[0]
 
 
+        codes_bestrq_emb     = codes_bestrq_emb.clamp(0, self.rvq_bestrq_emb.codebook_size - 1)
+        codes_bestrq_emb_bgm = codes_bestrq_emb_bgm.clamp(0, self.rvq_bestrq_bgm_emb.codebook_size - 1)
         quantized_bestrq_emb,_,_=self.rvq_bestrq_emb.from_codes(codes_bestrq_emb)
         quantized_bestrq_emb_bgm,_,_=self.rvq_bestrq_bgm_emb.from_codes(codes_bestrq_emb_bgm)
         quantized_bestrq_emb = quantized_bestrq_emb.permute(0,2,1).contiguous()

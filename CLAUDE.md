@@ -19,8 +19,10 @@ Three inference servers, all using the `musicgen` conda env (Python 3.10):
 
 ```bash
 # SongGeneration Pipeline (port 8888) — DEFAULT (auto GPU split, streaming, ~40s TTFB)
-# Auto-detects all available GPUs and splits between LM and Diffusion workers.
-nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && conda run -n musicgen --no-capture-output python -m uvicorn songgeneration_pipeline_server:app --host 0.0.0.0 --port 8888" >> logs/pipeline_stdout.log 2>&1 &
+# Prefer start_songgen_pipeline.sh which handles GPU assignment, auto-restart, and optimisation flags.
+bash /cephfs/volumes/hpc_data_usr/k1810895/8a1a0d1a-60bb-4617-8d51-f74c93f2c303/musicgen/start_songgen_pipeline.sh
+# Optimisations active: torch.compile (SONGGEN_COMPILE=1), Flash-Decoding (always on), Flash Attention 2 (always on).
+# First request after startup is slow (~extra 2–3 min) while torch.compile JITs the LM kernels.
 
 # SongGeneration vLLM (port 8888) — batched only, no streaming
 nohup bash -c "source /software/spackages_v0_21_prod/apps/linux-ubuntu22.04-icelake/gcc-13.2.0/anaconda3-2022.10-tjkkt6f5oslpe3qj7vrpvqrm7vru4k6e/etc/profile.d/conda.sh && cd /users/k1810895/data/musicgen && SONGGEN_GPU_IDS=0,1 SONGGEN_BATCH_MAX=2 conda run -n musicgen --no-capture-output python -m uvicorn songgeneration_vllm_server:app --host 0.0.0.0 --port 8888" >> logs/vllm_stdout.log 2>&1 &
