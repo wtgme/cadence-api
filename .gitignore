@@ -1,5 +1,11 @@
 # Model weights and large data
-songgeneration/
+songgeneration/ckpt/
+songgeneration/third_party/
+songgeneration/runtime/
+songgeneration/sample/generated/
+songgeneration/launchs/
+songgeneration/.ipynb_checkpoints/
+songgeneration/**/__pycache__/
 heartmula/
 
 # Runtime
