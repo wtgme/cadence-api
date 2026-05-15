@@ -83,3 +83,13 @@ See `scripts/hpc-tunnel.sh` in the [cadence](https://github.com/wtgme/cadence) r
 
 - SongGeneration v2-large: https://arxiv.org/pdf/2506.07520
 - HeartMuLa: https://arxiv.org/pdf/2601.10547
+
+## Acknowledgments
+
+The `songgeneration/` directory contains source code derived from
+[tencent-ailab/songgeneration](https://github.com/tencent-ailab/songgeneration)
+(Apache 2.0). Local modifications include the static KV cache,
+Flash-Decoding via `flash_attn_with_kvcache`, `torch.compile` integration,
+and batch + token-callback support for the streaming pipeline server.
+See `songgeneration/LICENSE` for the original license and
+`docs/superpowers/` for design notes on the changes.
