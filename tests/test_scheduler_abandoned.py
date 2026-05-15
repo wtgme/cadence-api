@@ -29,9 +29,13 @@ def _make_scheduler() -> "ps.PipelineScheduler":
     return s
 
 
-async def _run_scheduler_until_drained(s, deadline_s: float = 0.5):
-    """Run scheduler_loop briefly, then cancel. BATCH_WAIT_MS is on the order of
-    tens of ms; deadline_s well exceeds it so any pending pulls finish."""
+async def _run_scheduler_until_drained(s, deadline_s: float = 0.2):
+    """Run scheduler_loop briefly, then cancel.
+
+    The test cases here put the scheduler into the abandoned-skip path
+    immediately — the loop pulls one entry, finds it not in `pending`,
+    and continues. We never enter the coalescing window, so deadline_s
+    only needs to be long enough for that one pull-and-skip iteration."""
     task = asyncio.create_task(s.scheduler_loop())
     await asyncio.sleep(deadline_s)
     task.cancel()
