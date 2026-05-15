@@ -680,9 +680,11 @@ class PipelineScheduler:
         self.pending: dict[str, PendingRequest] = {}   # request_id → PendingRequest
         self._active_lm_batches: dict[str, int] = {}  # batch_id → lm_idx (for slot release)
 
-        self.total_batches   = 0
-        self.total_requests  = 0
-        self._started        = False
+        self.total_batches              = 0
+        self.total_requests             = 0
+        self.total_abandoned            = 0  # skipped pre-batch (client gone before dispatch)
+        self.total_dropped_at_dispatch  = 0  # filtered inside _dispatch_lm
+        self._started                   = False
 
     async def start_workers_parallel(self):
         """Start all workers simultaneously and wait for all to report ready.
@@ -784,6 +786,10 @@ class PipelineScheduler:
                  LM_GPU_IDS, DIFF_GPU_IDS, MAX_BATCH_SIZE)
         while True:
             first = await self.request_queue.get()
+            if first.request_id not in self.pending:
+                self.total_abandoned += 1
+                log.info("Skipping abandoned request %s (pre-batch)", first.request_id)
+                continue
             batch = [first]
             deadline = asyncio.get_event_loop().time() + BATCH_WAIT_MS / 1000
             while len(batch) < MAX_BATCH_SIZE:
@@ -792,9 +798,13 @@ class PipelineScheduler:
                     break
                 try:
                     req = await asyncio.wait_for(self.request_queue.get(), timeout=remaining)
-                    batch.append(req)
                 except asyncio.TimeoutError:
                     break
+                if req.request_id not in self.pending:
+                    self.total_abandoned += 1
+                    log.info("Skipping abandoned request %s (pre-batch)", req.request_id)
+                    continue
+                batch.append(req)
 
             self.total_batches  += 1
             self.total_requests += len(batch)
@@ -804,8 +814,20 @@ class PipelineScheduler:
 
     async def _dispatch_lm(self, batch: list[PendingRequest], lm_idx: int):
         batch_id = uuid.uuid4().hex[:8]
+        live = [pr for pr in batch if pr.request_id in self.pending]
+        if not live:
+            # Whole batch went stale between queue-pull and dispatch.
+            # Recycle the LM slot and do not register a phantom batch.
+            self.total_dropped_at_dispatch += len(batch)
+            log.info("All %d requests in batch went stale — releasing LM worker %d",
+                     len(batch), lm_idx)
+            self.available_lm.put_nowait(lm_idx)
+            return
+        if len(live) < len(batch):
+            self.total_dropped_at_dispatch += (len(batch) - len(live))
+            log.info("Batch shrunk from %d → %d (stale dropped)", len(batch), len(live))
         self._active_lm_batches[batch_id] = lm_idx  # so result_listener can release the slot
-        msg = {"batch_id": batch_id, "requests": [pr.params for pr in batch]}
+        msg = {"batch_id": batch_id, "requests": [pr.params for pr in live]}
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.lm_input_queues[lm_idx].put, msg)
 
@@ -1105,6 +1127,21 @@ def get_usage(n: int = 50):
         except json.JSONDecodeError:
             pass
     return out
+
+
+@app.get("/scheduler_stats")
+def get_scheduler_stats():
+    """Live counters from the PipelineScheduler.
+
+    Useful for confirming abandoned-request handling is firing in production.
+    Unlike /usage (which tails api_usage.log), this returns the in-memory
+    counters maintained by scheduler_loop and _dispatch_lm."""
+    return {
+        "total_requests":            scheduler.total_requests,
+        "total_batches":             scheduler.total_batches,
+        "total_abandoned":           scheduler.total_abandoned,
+        "total_dropped_at_dispatch": scheduler.total_dropped_at_dispatch,
+    }
 
 
 def _strip_xing_frame(mp3: bytes) -> bytes:
