@@ -58,3 +58,47 @@ def test_pre_batch_skip_abandoned_request():
         # LM slot must still be available.
         assert s.available_lm.qsize() == 1
     asyncio.run(run())
+
+
+def test_dispatch_filter_drops_one_of_two():
+    """One of two batched requests goes stale between queue-pull and dispatch."""
+    async def run():
+        s = _make_scheduler()
+        rid1, _ = await s.submit({"lyric": "."}, client_ip="t1")
+        rid2, _ = await s.submit({"lyric": "."}, client_ip="t2")
+        pr1 = s.pending[rid1]
+        pr2 = s.pending[rid2]
+        # Pop one from pending -- simulating disconnect after queue-pull,
+        # before _dispatch_lm runs.
+        s.pending.pop(rid1)
+        # Acquire an LM slot (matches what scheduler_loop would do).
+        lm_idx = await s.available_lm.get()
+        await s._dispatch_lm([pr1, pr2], lm_idx)
+        assert s.total_dropped_at_dispatch == 1
+        msg = s.lm_input_queues[0].get(timeout=1)
+        assert len(msg["requests"]) == 1
+        assert msg["requests"][0]["request_id"] == rid2
+    asyncio.run(run())
+
+
+def test_dispatch_filter_drops_whole_batch():
+    """All requests in a batch go stale before dispatch -- LM slot is recycled."""
+    async def run():
+        s = _make_scheduler()
+        rid1, _ = await s.submit({"lyric": "."}, client_ip="t1")
+        rid2, _ = await s.submit({"lyric": "."}, client_ip="t2")
+        pr1 = s.pending[rid1]
+        pr2 = s.pending[rid2]
+        s.pending.pop(rid1)
+        s.pending.pop(rid2)
+        lm_idx = await s.available_lm.get()
+        assert s.available_lm.qsize() == 0
+        await s._dispatch_lm([pr1, pr2], lm_idx)
+        assert s.total_dropped_at_dispatch == 2
+        # Nothing dispatched to the LM worker.
+        assert s.lm_input_queues[0].empty()
+        # LM slot was returned to the pool.
+        assert s.available_lm.qsize() == 1
+        # No phantom batch was registered.
+        assert s._active_lm_batches == {}
+    asyncio.run(run())

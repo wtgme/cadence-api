@@ -814,8 +814,20 @@ class PipelineScheduler:
 
     async def _dispatch_lm(self, batch: list[PendingRequest], lm_idx: int):
         batch_id = uuid.uuid4().hex[:8]
+        live = [pr for pr in batch if pr.request_id in self.pending]
+        if not live:
+            # Whole batch went stale between queue-pull and dispatch.
+            # Recycle the LM slot and do not register a phantom batch.
+            self.total_dropped_at_dispatch += len(batch)
+            log.info("All %d requests in batch went stale — releasing LM worker %d",
+                     len(batch), lm_idx)
+            self.available_lm.put_nowait(lm_idx)
+            return
+        if len(live) < len(batch):
+            self.total_dropped_at_dispatch += (len(batch) - len(live))
+            log.info("Batch shrunk from %d → %d (stale dropped)", len(batch), len(live))
         self._active_lm_batches[batch_id] = lm_idx  # so result_listener can release the slot
-        msg = {"batch_id": batch_id, "requests": [pr.params for pr in batch]}
+        msg = {"batch_id": batch_id, "requests": [pr.params for pr in live]}
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self.lm_input_queues[lm_idx].put, msg)
 
