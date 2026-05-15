@@ -1129,6 +1129,21 @@ def get_usage(n: int = 50):
     return out
 
 
+@app.get("/scheduler_stats")
+def get_scheduler_stats():
+    """Live counters from the PipelineScheduler.
+
+    Useful for confirming abandoned-request handling is firing in production.
+    Unlike /usage (which tails api_usage.log), this returns the in-memory
+    counters maintained by scheduler_loop and _dispatch_lm."""
+    return {
+        "total_requests":            scheduler.total_requests,
+        "total_batches":             scheduler.total_batches,
+        "total_abandoned":           scheduler.total_abandoned,
+        "total_dropped_at_dispatch": scheduler.total_dropped_at_dispatch,
+    }
+
+
 def _strip_xing_frame(mp3: bytes) -> bytes:
     """Drop the leading Xing/Info VBR-tag MPEG frame if present.
     torchaudio.save(format="mp3") prepends one silent Xing frame per chunk,
