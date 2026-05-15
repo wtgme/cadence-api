@@ -680,9 +680,11 @@ class PipelineScheduler:
         self.pending: dict[str, PendingRequest] = {}   # request_id → PendingRequest
         self._active_lm_batches: dict[str, int] = {}  # batch_id → lm_idx (for slot release)
 
-        self.total_batches   = 0
-        self.total_requests  = 0
-        self._started        = False
+        self.total_batches              = 0
+        self.total_requests             = 0
+        self.total_abandoned            = 0  # skipped pre-batch (client gone before dispatch)
+        self.total_dropped_at_dispatch  = 0  # filtered inside _dispatch_lm
+        self._started                   = False
 
     async def start_workers_parallel(self):
         """Start all workers simultaneously and wait for all to report ready.
@@ -784,6 +786,10 @@ class PipelineScheduler:
                  LM_GPU_IDS, DIFF_GPU_IDS, MAX_BATCH_SIZE)
         while True:
             first = await self.request_queue.get()
+            if first.request_id not in self.pending:
+                self.total_abandoned += 1
+                log.info("Skipping abandoned request %s (pre-batch)", first.request_id)
+                continue
             batch = [first]
             deadline = asyncio.get_event_loop().time() + BATCH_WAIT_MS / 1000
             while len(batch) < MAX_BATCH_SIZE:
@@ -792,9 +798,13 @@ class PipelineScheduler:
                     break
                 try:
                     req = await asyncio.wait_for(self.request_queue.get(), timeout=remaining)
-                    batch.append(req)
                 except asyncio.TimeoutError:
                     break
+                if req.request_id not in self.pending:
+                    self.total_abandoned += 1
+                    log.info("Skipping abandoned request %s (pre-batch)", req.request_id)
+                    continue
+                batch.append(req)
 
             self.total_batches  += 1
             self.total_requests += len(batch)
