@@ -599,6 +599,10 @@ class PromptCondAudioDiffusion(nn.Module):
         batch_size = codes_bestrq_emb.shape[0]
 
 
+        # Defense in depth against the CUDA assert in rvq.from_codes when the
+        # LM emits structure/EOS codes (>16383). The pipeline server now
+        # truncates such timesteps in lm_worker_fn before dispatch (search for
+        # AUDIO_CODE_MAX); this clamp is a safety net for any other caller.
         codes_bestrq_emb     = codes_bestrq_emb.clamp(0, self.rvq_bestrq_emb.codebook_size - 1)
         codes_bestrq_emb_bgm = codes_bestrq_emb_bgm.clamp(0, self.rvq_bestrq_bgm_emb.codebook_size - 1)
         quantized_bestrq_emb,_,_=self.rvq_bestrq_emb.from_codes(codes_bestrq_emb)

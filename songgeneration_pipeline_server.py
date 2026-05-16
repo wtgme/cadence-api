@@ -126,6 +126,19 @@ else:
 WINDOW_TOKENS  = 1000
 # How often the LM callback fires (250 tokens ≈ 10 s of audio)
 CALLBACK_EVERY = 250
+# RVQ audio codebook upper bound (matches rvq_bestrq_emb.codebook_size-1 = 16383).
+# Any LM-emitted code > AUDIO_CODE_MAX is a structure/EOS token that the
+# diffusion decoder cannot represent; decoding such codes (even via the
+# defensive clamp in model_septoken.py) produces noise. We truncate the
+# token stream at the first such timestep before dispatching diff jobs.
+AUDIO_CODE_MAX = 16383
+
+
+def _valid_prefix_len(codes_kt: torch.Tensor) -> int:
+    """Length of the contiguous prefix where all codebooks are in [0, AUDIO_CODE_MAX]. Accepts [K, T]."""
+    valid_t = ((codes_kt >= 0) & (codes_kt <= AUDIO_CODE_MAX)).all(dim=0)
+    inv = (~valid_t).nonzero(as_tuple=True)[0]
+    return int(inv[0].item()) if inv.numel() > 0 else int(valid_t.numel())
 
 SONGGEN_ROOT = Path("/cephfs/volumes/hpc_data_usr/k1810895/8a1a0d1a-60bb-4617-8d51-f74c93f2c303/musicgen/songgeneration")
 CKPT_PATH    = SONGGEN_ROOT / "ckpt" / "songgeneration_v2_large"
@@ -409,10 +422,12 @@ def lm_worker_fn(
             """Called every CALLBACK_EVERY LM steps with shape [B, K, S]."""
             gen_seq_cpu = gen_seq.detach().cpu()
             out_codes, _, _ = pattern.revert_pattern_sequence(gen_seq_cpu, special_token=-1)
-            valid = (out_codes >= 0).all(dim=1)  # [B, T_full]
 
             for i in range(B):
-                t_safe = int(valid[i].sum().item())
+                # Contiguous prefix of timesteps where every codebook is a
+                # valid audio code (0..AUDIO_CODE_MAX). Stops at the first
+                # structure/EOS token to avoid streaming garbage to diff.
+                t_safe = _valid_prefix_len(out_codes[i])
                 while t_safe - last_decoded[i] >= WINDOW_TOKENS:
                     sl = out_codes[i:i+1, :, last_decoded[i]:last_decoded[i] + WINDOW_TOKENS]
                     diff_queue.put(DiffusionJob(
@@ -458,17 +473,19 @@ def lm_worker_fn(
             # callback fired during generation). Split tokens into WINDOW_TOKENS
             # chunks plus a residual.
             if SHARED_GPU_MODE:
-                T = tokens.shape[-1]
                 for i in range(B):
-                    for start in range(0, T, WINDOW_TOKENS):
-                        end   = min(start + WINDOW_TOKENS, T)
+                    t_eff = _valid_prefix_len(tokens[i])
+                    if t_eff == 0:
+                        continue  # error path below handles "no chunks queued"
+                    for start in range(0, t_eff, WINDOW_TOKENS):
+                        end   = min(start + WINDOW_TOKENS, t_eff)
                         sl    = tokens[i:i+1, :, start:end]
                         diff_queue.put(DiffusionJob(
                             request_id=requests[i]["request_id"],
                             chunk_index=chunk_indices[i],
                             token_slice=sl.cpu().numpy().tobytes(),
                             gen_type=requests[i].get("generate_type", "bgm"),
-                            is_final=(end == T),
+                            is_final=(end == t_eff),
                         ))
                         chunk_indices[i] += 1
                         last_decoded[i]  = end
@@ -483,8 +500,11 @@ def lm_worker_fn(
                         out_queue.put({"type": "chunk_error",
                                        "request_id": rid,
                                        "error": "LM produced no tokens"})
-                elif tokens.shape[-1] > last_decoded[i]:
-                    sl = tokens[i:i+1, :, last_decoded[i]:]
+                elif _valid_prefix_len(tokens[i]) > last_decoded[i]:
+                    # Only stream the valid prefix of the residual; the rest
+                    # is structure/EOS tokens that would decode as noise.
+                    t_eff = _valid_prefix_len(tokens[i])
+                    sl = tokens[i:i+1, :, last_decoded[i]:t_eff]
                     diff_queue.put(DiffusionJob(
                         request_id=rid,
                         chunk_index=chunk_indices[i],
