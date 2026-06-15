@@ -22,8 +22,20 @@ tmux kill-session -t tunnel 2>/dev/null
 pkill -x cloudflared 2>/dev/null
 sleep 1
 
-: > "$LOG"
-tmux new-session -d -s tunnel "cloudflared tunnel --loglevel info run --token $TUNNEL_TOKEN 2>&1 | tee $LOG"
+# Keep one previous log so we can see WHY it died last time (don't truncate live).
+[ -f "$LOG" ] && mv -f "$LOG" "$LOG.prev" 2>/dev/null
+
+# Supervisor loop: if cloudflared exits for ANY reason (network blip, signal),
+# restart it after 5s. --no-autoupdate stops the built-in ~daily self-restart
+# that previously took the tunnel down (auto-updater swaps the binary and the
+# old process exits; nothing brought it back). Update cloudflared manually.
+tmux new-session -d -s tunnel \
+  "while true; do \
+     echo \"[supervisor] starting cloudflared at \$(date -u +%FT%TZ)\"; \
+     cloudflared tunnel --no-autoupdate --loglevel info run --token $TUNNEL_TOKEN 2>&1; \
+     echo \"[supervisor] cloudflared exited (\$?) at \$(date -u +%FT%TZ); restart in 5s\"; \
+     sleep 5; \
+   done | tee -a $LOG"
 
 count_conns() {
   local n
