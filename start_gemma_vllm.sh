@@ -22,7 +22,11 @@ GEMMA_MODEL=${GEMMA_MODEL:-google/gemma-4-E4B-it}
 # us swap in gemma-4-12B-it without clients having to change the model name they send.
 GEMMA_SERVED_NAME=${GEMMA_SERVED_NAME:-google/gemma-4-E4B-it}
 
-COMMON_FLAGS="--port 8000 --served-model-name $GEMMA_SERVED_NAME --max-model-len 16384 --gpu-memory-utilization 0.9 --enable-prefix-caching --trust-remote-code --enforce-eager"
+# --safetensors-load-strategy prefetch: weights live on CephFS, which vLLM does not
+# recognise as a network FS (it only auto-prefetches on NFS/Lustre), so it falls back to
+# lazy mmap and pays for random reads over the network. Forcing prefetch pulls the
+# checkpoint into the page cache up front. Supported on both vllmenv (0.19.0) and gemma4.
+COMMON_FLAGS="--port 8000 --served-model-name $GEMMA_SERVED_NAME --max-model-len 16384 --gpu-memory-utilization 0.9 --enable-prefix-caching --trust-remote-code --enforce-eager --safetensors-load-strategy prefetch"
 
 EXTRA_ENV=""
 EXTRA_FLAGS=""
@@ -33,8 +37,10 @@ if [[ "$GEMMA_MODEL" == *12B* ]]; then
   # a fragile FlashInfer JIT build of the sampler kernel at engine startup.
   CUDA12_HOME=${CUDA12_HOME:-/software/spackages_v0_21_prod/apps/linux-ubuntu22.04-zen4/gcc-13.2.0/cuda-12.2.1-k46nrhwopvi5zfrnp2ckit4quy6lir53}
   EXTRA_ENV="export CUDA_HOME=$CUDA12_HOME && export PATH=$CUDA12_HOME/bin:\$PATH && export VLLM_USE_FLASHINFER_SAMPLER=0 &&"
-  # Text-only ({"image":0,"audio":0}) — skips multimodal overhead for the chat backend.
-  EXTRA_FLAGS="--limit-mm-per-prompt '{\"image\": 0, \"audio\": 0}'"
+  # Text-only — skips multimodal overhead for the chat backend. gemma4_unified also has a
+  # video modality; without video:0 the engine still reserves an encoder cache budget and
+  # profiles a video item at startup.
+  EXTRA_FLAGS="--limit-mm-per-prompt '{\"image\": 0, \"audio\": 0, \"video\": 0}'"
 fi
 
 nohup bash -c "source $CONDA_SH && $EXTRA_ENV CUDA_VISIBLE_DEVICES=$GEMMA_GPU conda run -n $GEMMA_ENV --no-capture-output vllm serve $GEMMA_MODEL $COMMON_FLAGS $EXTRA_FLAGS" >> "$WORKDIR/logs/vllm_gemma_stdout.log" 2>&1 &
